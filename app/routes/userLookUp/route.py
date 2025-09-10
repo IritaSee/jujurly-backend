@@ -1,9 +1,9 @@
 from flask import Blueprint, request, jsonify
 from app.model import User
 
-userLookUp = Blueprint('userLookUp', __name__)
+userLookUp = Blueprint('lookup', __name__ , url_prefix='/api/user/')
 
-@userLookUp.route('/api/user/<identifier>', methods=['GET'])
+@userLookUp.route('/<identifier>', methods=['GET'])
 def lookup_user(identifier):
     # Try to find user by username or link_id or email
     # user_username = User.query.filter((User.username == identifier)).first()
