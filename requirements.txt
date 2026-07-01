@@ -1,6 +1,7 @@
 Flask
 Flask-CORS
 Flask-SQLAlchemy
+Flask-Migrate
 psycopg2-binary
 Werkzeug
 openai
