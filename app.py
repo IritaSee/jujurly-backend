@@ -2,6 +2,7 @@ import flask
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
 import os
 from werkzeug.security import generate_password_hash, check_password_hash # Added for password hashing
 import uuid # Moved import to top
@@ -50,6 +51,11 @@ class Feedback(db.Model):
     anon_email = db.Column(db.String(120), nullable=True)
     is_read = db.Column(db.Boolean, default=False, nullable=False)
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
+    # Cached LLM output (populated on submit, or lazily on first read of older rows)
+    llm_sentiment = db.Column(db.String(100), nullable=True)
+    llm_summary = db.Column(db.Text, nullable=True)
+    llm_constructive_criticism = db.Column(db.Text, nullable=True)
+    llm_processed_at = db.Column(db.DateTime, nullable=True)
 
     def __repr__(self):
         return f'<Feedback {self.id} for User {self.user_id}>'
@@ -59,9 +65,74 @@ class Feedback(db.Model):
 def generate_unique_link_id():
     return str(uuid.uuid4())[:8] # Example: first 8 chars of a UUID
 
+def process_and_cache_feedback(fb_item):
+    """
+    Runs the feedback through the LLM, writes the result onto the Feedback row's
+    llm_* cache columns, commits, and returns the (sentiment, summary, constructiveCriticism)
+    tuple ready for the API response. Never raises - falls back to placeholder text
+    and leaves llm_processed_at unset on failure, so it will be retried on next read.
+    """
+    feedback_input_dict = {
+        'anon_identifier': fb_item.anon_identifier or 'Tidak disebutkan',
+        'context_text': fb_item.context_text or 'Tidak disebutkan',
+        'feedback_text': fb_item.feedback_text
+    }
+
+    # Default values for LLM processed fields
+    parsed_sentiment = "Netral Aja 😐"
+    parsed_summary = "Tidak dapat memproses ringkasan saat ini."
+    parsed_constructive_criticism = "Tidak ada saran spesifik saat ini."
+
+    try:
+        llm_response_dict = llm_handler.summarize_text_with_llm(
+            item_to_summarise=feedback_input_dict,
+            model_provider="anthropic" # Or get from os.getenv('MODEL_TYPE', "anthropic")
+        )
+
+        raw_sentiment = llm_response_dict.get("sentiment", "Netral Aja")
+        if "error" in raw_sentiment.lower() or "could not process" in llm_response_dict.get("summary", "").lower():
+            # Keep default error messages if LLM indicated an issue; don't cache a failure.
+            return parsed_sentiment, parsed_summary, parsed_constructive_criticism
+
+        parsed_summary = llm_response_dict.get("summary", parsed_summary)
+        parsed_constructive_criticism = llm_response_dict.get("constructiveCriticism", parsed_constructive_criticism)
+
+        # Add emoji to sentiment
+        if "positif" in raw_sentiment.lower():
+            parsed_sentiment = f"{raw_sentiment} 👍"
+        elif "negatif" in raw_sentiment.lower():
+            parsed_sentiment = f"{raw_sentiment} 😟"
+        else: # Netral or other
+            parsed_sentiment = f"{raw_sentiment} 😐"
+
+        fb_item.llm_sentiment = parsed_sentiment
+        fb_item.llm_summary = parsed_summary
+        fb_item.llm_constructive_criticism = parsed_constructive_criticism
+        fb_item.llm_processed_at = datetime.utcnow()
+        db.session.commit()
+
+    except (ValueError, NotImplementedError) as e:
+        print(f"LLM configuration error for feedback ID {fb_item.id}: {e}")
+        # Fallback values are already set (parsed_sentiment, parsed_summary, etc.)
+    except Exception as e:
+        print(f"Error processing feedback ID {fb_item.id} with LLM: {e}")
+        # Fallback values are already set
+
+    return parsed_sentiment, parsed_summary, parsed_constructive_criticism
+
 # Create database tables if they don't exist
 with app.app_context():
     db.create_all()
+    # db.create_all() only creates missing tables, it never alters existing ones.
+    # Since this project has no migration framework (Alembic/Flask-Migrate), backfill
+    # the new LLM-cache columns on an already-existing `feedback` table by hand.
+    # Idempotent (IF NOT EXISTS) so it's safe to run on every startup.
+    if db.engine.dialect.name == 'postgresql':
+        with db.engine.begin() as conn:
+            conn.execute(text("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS llm_sentiment VARCHAR(100)"))
+            conn.execute(text("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS llm_summary TEXT"))
+            conn.execute(text("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS llm_constructive_criticism TEXT"))
+            conn.execute(text("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS llm_processed_at TIMESTAMP"))
 
 @app.route('/api/auth/register', methods=['POST'])
 def register_user():
@@ -217,6 +288,11 @@ def submit_feedback(identifier):
     db.session.add(new_feedback)
     db.session.commit()
 
+    # Warm the LLM cache immediately so the dashboard's first read is already fast.
+    # If this fails (LLM error/timeout), the feedback is still saved; get_user_feedbacks
+    # will retry the LLM call lazily on first read.
+    process_and_cache_feedback(new_feedback)
+
     return jsonify({'message': 'Feedback submitted successfully', 'feedback_id': new_feedback.id}), 201
 
 @app.route('/api/users/<identifier>/feedbacks', methods=['GET'])
@@ -235,50 +311,14 @@ def get_user_feedbacks(identifier):
     processed_feedbacks = []
 
     for fb_item in feedbacks_from_db:
-        # Prepare the dictionary input for the LLM handler
-        feedback_input_dict = {
-            'anon_identifier': fb_item.anon_identifier or 'Tidak disebutkan',
-            'context_text': fb_item.context_text or 'Tidak disebutkan',
-            'feedback_text': fb_item.feedback_text
-        }
-
-        # Default values for LLM processed fields
-        parsed_sentiment = "Netral Aja 😐"
-        parsed_summary = "Tidak dapat memproses ringkasan saat ini."
-        parsed_constructive_criticism = "Tidak ada saran spesifik saat ini."
-
-        try:
-            # Call the updated LLM handler
-            llm_response_dict = llm_handler.summarize_text_with_llm(
-                item_to_summarise=feedback_input_dict,
-                model_provider="anthropic" # Or get from os.getenv('MODEL_TYPE', "anthropic")
-            )
-
-            # Extract information from the LLM response dictionary
-            # Add emojis based on sentiment, similar to frontend mock
-            raw_sentiment = llm_response_dict.get("sentiment", "Netral Aja")
-            if "error" in raw_sentiment.lower() or "could not process" in llm_response_dict.get("summary", "").lower():
-                # Keep default error messages if LLM indicated an issue
-                pass
-            else:
-                parsed_summary = llm_response_dict.get("summary", parsed_summary)
-                parsed_constructive_criticism = llm_response_dict.get("constructiveCriticism", parsed_constructive_criticism)
-                
-                # Add emoji to sentiment
-                if "positif" in raw_sentiment.lower():
-                    parsed_sentiment = f"{raw_sentiment} 👍"
-                elif "negatif" in raw_sentiment.lower():
-                    parsed_sentiment = f"{raw_sentiment} 😟"
-                else: # Netral or other
-                    parsed_sentiment = f"{raw_sentiment} 😐"
-
-
-        except (ValueError, NotImplementedError) as e:
-            print(f"LLM configuration error for feedback ID {fb_item.id}: {e}")
-            # Fallback values are already set (parsed_sentiment, parsed_summary, etc.)
-        except Exception as e:
-            print(f"Error processing feedback ID {fb_item.id} with LLM: {e}")
-            # Fallback values are already set
+        if fb_item.llm_processed_at is not None:
+            # Already cached (either from submit-time processing or a previous read) - no LLM call.
+            parsed_sentiment = fb_item.llm_sentiment
+            parsed_summary = fb_item.llm_summary
+            parsed_constructive_criticism = fb_item.llm_constructive_criticism
+        else:
+            # Not cached yet (older row from before this feature, or submit-time call failed) - compute once and persist.
+            parsed_sentiment, parsed_summary, parsed_constructive_criticism = process_and_cache_feedback(fb_item)
 
         # Determine context for display
         item_context_display = fb_item.context_text if fb_item.context_text and fb_item.context_text.strip() != '-' else \
